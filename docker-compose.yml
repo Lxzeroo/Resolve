@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    volumes:
+      - ./data:/code/data
+    environment:
+      DATABASE_URL: sqlite:////code/data/resolveai.db
+    restart: unless-stopped
