@@ -2,7 +2,7 @@
 
 An executable portfolio MVP for customer-support classification, verified order lookup, draft generation, manual approvals, and audit events. Dark-mode dashboard included.
 
-> **Status: initial prototype.** No real inbox ingestion, email sending, webhook delivery, Slack alerts, calibrated LLM evaluation, or production-grade authentication yet. Never connect this prototype to real customer data without security review.
+> **Status: Phase 2 + 3 local prototype.** Gmail read-only ingestion, Google Sheets order import, Slack escalation worker, structured optional LLM triage and offline evaluation are now implemented. No outbound customer emails. Not production-hardened; avoid real customer data until security review. See [PHASE_2_3.md](PHASE_2_3.md) for setup.
 
 ## Local quickstart (Python 3.12+)
 
@@ -74,3 +74,12 @@ Use `X-Admin-Token` for API requests when demo mode is disabled.
 `pytest -q`
 
 All project data in the demonstration should be synthetic. MIT license can be added after choosing a licensing policy.
+
+## Phase 2 + 3 additions
+
+- Optional structured LLM classification and safe rules fallback; all replies need human approval
+- Read-only Gmail sync and Google Sheets service-account order import
+- Durable single-worker Slack escalation queue with retries and visible job status
+- Synthetic labeled dataset and `python -m app.evaluate`
+
+See [Phase 2 + 3 setup](PHASE_2_3.md).

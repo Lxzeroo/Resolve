@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from app.triage import Classification, classify_with_llm, enforce_safety
+from app.integrations import IntegrationError, gmail_fetch, sheets_fetch
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./resolveai.db")
 if DATABASE_URL.startswith("sqlite"):
@@ -67,6 +69,17 @@ class AuditEvent(Base):
     event: Mapped[str] = mapped_column(String(50))
     details: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class Job(Base):
+    __tablename__ = 'jobs'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'))
+    kind: Mapped[str] = mapped_column(String(30), default='slack_escalation')
+    status: Mapped[str] = mapped_column(String(20), default='pending')
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    last_error: Mapped[str | None] = mapped_column(String(80))
 
 
 class NewTicket(BaseModel):
@@ -175,7 +188,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="ResolveAI", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ResolveAI", version="0.2.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -201,30 +214,93 @@ def audit(ticket_id: int, db: Session = Depends(db_session)):
     return [{"event": e.event, "details": e.details, "created_at": e.created_at.isoformat()} for e in db.scalars(select(AuditEvent).where(AuditEvent.ticket_id == ticket_id).order_by(AuditEvent.id)).all()]
 
 
-@app.post("/api/tickets", status_code=201, dependencies=[Depends(require_admin)])
-async def create_ticket(payload: NewTicket, db: Session = Depends(db_session)):
+async def ingest_ticket(payload: NewTicket, db: Session) -> tuple[Ticket, bool]:
     if payload.external_id:
-        prior = db.scalar(select(Ticket).where(Ticket.external_id == payload.external_id))
-        if prior:
-            return serialize(prior)
+        previous = db.scalar(select(Ticket).where(Ticket.external_id == payload.external_id))
+        if previous:
+            return previous, False
     category, priority, confidence, order_id = categorize(payload.subject, payload.body)
+    llm = await classify_with_llm(payload.subject, payload.body)
+    if llm:
+        safe = enforce_safety(llm, payload.subject, payload.body, order_id)
+        category, priority, confidence = safe.category, safe.priority, safe.confidence
     order = db.get(Order, order_id) if order_id else None
-    # Never leak another customer's order facts based on only an order number.
     if order and order.customer_email.lower() != payload.sender.lower():
         order = None
     verified = f"Order {order.id}: status {order.status}; ETA {order.eta}" if order else "No verified order data."
-    draft = build_draft(category, payload.sender, order, order_id)
-    # Only use AI when enabled. Output is a draft, never sent automatically.
-    draft = await optional_llm_draft(payload, category, verified, draft)
+    fallback = build_draft(category, payload.sender, order, order_id)
+    draft = await optional_llm_draft(payload, category, verified, fallback)
     t = Ticket(sender=payload.sender, subject=payload.subject, body=payload.body,
                source=payload.source, external_id=payload.external_id, category=category,
                priority=priority, confidence=confidence, order_id=order_id, draft=draft)
     db.add(t)
     db.flush()
-    db.add(AuditEvent(ticket_id=t.id, event="ticket_created", details=f"Classified as {category}; heuristic score {confidence}; review required"))
+    provider = 'LLM' if llm else 'rules'
+    db.add(AuditEvent(ticket_id=t.id, event='ticket_created', details=f'Classified as {category}; {provider} score {confidence}; review required'))
+    if priority in ('urgent', 'high') or confidence < 70:
+        db.add(Job(ticket_id=t.id, kind='slack_escalation'))
+        db.add(AuditEvent(ticket_id=t.id, event='escalation_queued', details='Slack escalation queued; worker delivery pending'))
     db.commit()
     db.refresh(t)
-    return serialize(t)
+    return t, True
+
+
+@app.post("/api/tickets", status_code=201, dependencies=[Depends(require_admin)])
+async def create_ticket(payload: NewTicket, db: Session = Depends(db_session)):
+    ticket, _ = await ingest_ticket(payload, db)
+    return serialize(ticket)
+
+
+@app.post('/api/integrations/gmail/sync', dependencies=[Depends(require_admin)])
+async def sync_gmail(db: Session = Depends(db_session)):
+    try:
+        messages = await gmail_fetch(limit=20)
+    except IntegrationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, 'Gmail API request failed') from exc
+    imported, duplicates = 0, 0
+    for message in messages:
+        try:
+            payload = NewTicket.model_validate(message)
+            _, created = await ingest_ticket(payload, db)
+            imported += int(created)
+            duplicates += int(not created)
+        except (ValueError, TypeError):
+            continue
+    return {'fetched': len(messages), 'imported': imported, 'duplicates': duplicates}
+
+
+@app.post('/api/integrations/sheets/sync', dependencies=[Depends(require_admin)])
+async def sync_sheets(db: Session = Depends(db_session)):
+    try:
+        rows = await sheets_fetch()
+    except IntegrationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, 'Sheets API request failed') from exc
+    imported, invalid = 0, 0
+    for row in rows:
+        try:
+            item = OrderInput.model_validate(row)
+        except (ValueError, TypeError):
+            invalid += 1
+            continue
+        order = db.get(Order, item.id)
+        if order:
+            order.customer_email, order.status, order.eta = item.customer_email, item.status, item.eta
+        else:
+            db.add(Order(**item.model_dump()))
+        imported += 1
+    db.commit()
+    return {'imported': imported, 'invalid': invalid}
+
+
+@app.get('/api/jobs', dependencies=[Depends(require_admin)])
+def list_jobs(db: Session = Depends(db_session)):
+    jobs = db.scalars(select(Job).order_by(Job.id.desc()).limit(100)).all()
+    return [{'id': j.id, 'ticket_id': j.ticket_id, 'status': j.status, 'attempts': j.attempts,
+             'next_attempt_at': j.next_attempt_at.isoformat(), 'last_error': j.last_error} for j in jobs]
 
 
 @app.post("/api/tickets/{ticket_id}/review", dependencies=[Depends(require_admin)])

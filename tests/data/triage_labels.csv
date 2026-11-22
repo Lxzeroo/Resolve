@@ -1,0 +1,11 @@
+subject,body,category
+Where is order,Can you track ORD-1042?,order_status
+Delivery inquiry,When will the package arrive?,order_status
+Refund request,I need my money back,refund
+Return item,Please return my item and refund me,refund
+Broken item,The product arrived damaged,complaint
+Your service is terrible,I am very disappointed,complaint
+Need help,I have a general question,general
+Thank you,Thanks for your help,general
+Tracking info,Is ORD-1043 shipped?,order_status
+Complaint,I will contact my lawyer,complaint
