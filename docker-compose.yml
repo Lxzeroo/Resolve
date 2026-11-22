@@ -1,11 +1,45 @@
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: resolve
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: resolve
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolve -d resolve"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
   api:
     build: .
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
     env_file: .env
-    volumes:
-      - ./data:/code/data
     environment:
-      DATABASE_URL: sqlite:////code/data/resolveai.db
+      DATABASE_URL: postgresql+psycopg://resolve:${POSTGRES_PASSWORD}@db:5432/resolve
+      DEMO_MODE: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+  worker:
+    build: .
     restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://resolve:${POSTGRES_PASSWORD}@db:5432/resolve
+      DEMO_MODE: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  pgdata:

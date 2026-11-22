@@ -6,6 +6,11 @@ LLM calls only prepare drafts; neither rules nor LLM responses send email.
 import os
 import re
 import secrets
+import hashlib
+import hmac
+import time
+from collections import defaultdict
+from datetime import timedelta
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,8 +20,10 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -30,11 +37,47 @@ else:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "12"))
+LOGIN_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
 DEMO_MODE = os.environ.get("DEMO_MODE", "false").lower() == "true"
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class StaffUser(Base):
+    __tablename__ = "staff_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="agent")
+    active: Mapped[bool] = mapped_column(default=True)
+
+
+class LoginSession(Base):
+    __tablename__ = "login_sessions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("staff_users.id"))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return f"scrypt${salt.hex()}${derived.hex()}"
+
+
+def check_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, salt, expected = encoded.split("$")
+        if algorithm != "scrypt":
+            return False
+        actual = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1)
+        return hmac.compare_digest(actual, bytes.fromhex(expected))
+    except (ValueError, TypeError):
+        return False
 
 
 class Order(Base):
@@ -82,6 +125,17 @@ class Job(Base):
     last_error: Mapped[str | None] = mapped_column(String(80))
 
 
+class LoginInput(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class NewStaff(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=12, max_length=256)
+    role: Literal["admin", "agent"] = "agent"
+
+
 class NewTicket(BaseModel):
     sender: str = Field(min_length=3, max_length=255)
     subject: str = Field(min_length=1, max_length=250)
@@ -107,12 +161,33 @@ def db_session():
         yield db
 
 
-def require_admin(x_admin_token: str | None = Header(default=None)):
-    # Explicit opt-in demo mode is intended for localhost development only.
-    if DEMO_MODE and not ADMIN_TOKEN:
-        return
-    if not ADMIN_TOKEN or not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
-        raise HTTPException(status_code=401, detail="Valid X-Admin-Token required")
+def require_staff(request: Request, db: Session = Depends(db_session),
+                  x_admin_token: str | None = Header(default=None),
+                  authorization: str | None = Header(default=None)) -> StaffUser | None:
+    # Demo bypass is only reachable from local clients; do not deploy DEMO_MODE=true.
+    peer = request.client.host if request.client else ""
+    if DEMO_MODE and not ADMIN_TOKEN and peer in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return None
+    if ADMIN_TOKEN and x_admin_token and secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
+        return None  # Legacy integration token; admin-equivalent, keep secret.
+    if authorization and authorization.startswith("Bearer "):
+        digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+        session = db.scalar(select(LoginSession).where(LoginSession.token_hash == digest))
+        if session and session.expires_at > datetime.now(timezone.utc).replace(tzinfo=None):
+            user = db.get(StaffUser, session.user_id)
+            if user and user.active:
+                return user
+    raise HTTPException(401, "Authentication required")
+
+
+def require_admin(user: StaffUser | None = Depends(require_staff)):
+    if user is not None and user.role != "admin":
+        raise HTTPException(403, "Administrator role required")
+    return user
+
+
+def require_agent(user: StaffUser | None = Depends(require_staff)):
+    return user
 
 
 def categorize(subject: str, body: str):
@@ -185,11 +260,92 @@ def serialize(t: Ticket):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
+    email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+    if email and password and not DEMO_MODE:
+        if len(password) < 12:
+            raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must be at least 12 characters")
+        with SessionLocal() as db:
+            if not db.scalar(select(StaffUser).where(StaffUser.email == email)):
+                db.add(StaffUser(email=email, password_hash=hash_password(password), role="admin"))
+                db.commit()
     yield
 
 
-app = FastAPI(title="ResolveAI", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="ResolveAI", version="0.4.0", lifespan=lifespan,
+              docs_url="/docs" if os.getenv("ENABLE_API_DOCS", "false").lower() == "true" else None,
+              redoc_url=None)
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    return response
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginInput, request: Request, db: Session = Depends(db_session)):
+    peer = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    recent = [t for t in LOGIN_ATTEMPTS[peer] if now - t < 300]
+    LOGIN_ATTEMPTS[peer] = recent
+    if len(recent) >= 10:
+        raise HTTPException(429, "Too many login attempts. Try again later")
+    user = db.scalar(select(StaffUser).where(StaffUser.email == payload.email.strip().lower()))
+    if not user or not user.active or not check_password(payload.password, user.password_hash):
+        LOGIN_ATTEMPTS[peer].append(now)
+        raise HTTPException(401, "Invalid credentials")
+    LOGIN_ATTEMPTS.pop(peer, None)
+    token = secrets.token_urlsafe(40)
+    db.add(LoginSession(user_id=user.id, token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                        expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=SESSION_HOURS)))
+    db.commit()
+    return {"access_token": token, "token_type": "bearer", "role": user.role,
+            "email": user.email, "expires_in": SESSION_HOURS * 3600}
+
+
+@app.post("/api/auth/logout", dependencies=[Depends(require_agent)])
+def logout(authorization: str | None = Header(default=None), db: Session = Depends(db_session)):
+    if authorization and authorization.startswith("Bearer "):
+        digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+        session = db.scalar(select(LoginSession).where(LoginSession.token_hash == digest))
+        if session:
+            db.delete(session)
+            db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/auth/me", dependencies=[Depends(require_agent)])
+def whoami(user: StaffUser | None = Depends(require_agent)):
+    return {"email": user.email, "role": user.role} if user else {"email": "demo", "role": "admin"}
+
+
+@app.post("/api/admin/staff", status_code=201, dependencies=[Depends(require_admin)])
+def create_staff(payload: NewStaff, db: Session = Depends(db_session)):
+    email = payload.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(422, "Valid email required")
+    if db.scalar(select(StaffUser).where(StaffUser.email == email)):
+        raise HTTPException(409, "User exists")
+    user = StaffUser(email=email, password_hash=hash_password(payload.password), role=payload.role)
+    db.add(user)
+    db.commit()
+    return {"id": user.id, "email": email, "role": user.role}
+
+
+@app.get("/api/admin/staff", dependencies=[Depends(require_admin)])
+def list_staff(db: Session = Depends(db_session)):
+    return [{"id": u.id, "email": u.email, "role": u.role, "active": u.active}
+            for u in db.scalars(select(StaffUser).order_by(StaffUser.id)).all()]
+
+
+
+
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 @app.get("/")
 def home():
@@ -201,13 +357,13 @@ def health():
     return {"status": "ok", "mode": "demo" if DEMO_MODE else "secured"}
 
 
-@app.get("/api/tickets", dependencies=[Depends(require_admin)])
+@app.get("/api/tickets", dependencies=[Depends(require_agent)])
 def list_tickets(db: Session = Depends(db_session)):
     tickets = db.scalars(select(Ticket).order_by(Ticket.id.desc()).limit(100)).all()
     return [serialize(t) for t in tickets]
 
 
-@app.get("/api/tickets/{ticket_id}/audit", dependencies=[Depends(require_admin)])
+@app.get("/api/tickets/{ticket_id}/audit", dependencies=[Depends(require_agent)])
 def audit(ticket_id: int, db: Session = Depends(db_session)):
     if not db.get(Ticket, ticket_id):
         raise HTTPException(404, "Ticket not found")
@@ -245,7 +401,7 @@ async def ingest_ticket(payload: NewTicket, db: Session) -> tuple[Ticket, bool]:
     return t, True
 
 
-@app.post("/api/tickets", status_code=201, dependencies=[Depends(require_admin)])
+@app.post("/api/tickets", status_code=201, dependencies=[Depends(require_agent)])
 async def create_ticket(payload: NewTicket, db: Session = Depends(db_session)):
     ticket, _ = await ingest_ticket(payload, db)
     return serialize(ticket)
@@ -296,14 +452,14 @@ async def sync_sheets(db: Session = Depends(db_session)):
     return {'imported': imported, 'invalid': invalid}
 
 
-@app.get('/api/jobs', dependencies=[Depends(require_admin)])
+@app.get('/api/jobs', dependencies=[Depends(require_agent)])
 def list_jobs(db: Session = Depends(db_session)):
     jobs = db.scalars(select(Job).order_by(Job.id.desc()).limit(100)).all()
     return [{'id': j.id, 'ticket_id': j.ticket_id, 'status': j.status, 'attempts': j.attempts,
              'next_attempt_at': j.next_attempt_at.isoformat(), 'last_error': j.last_error} for j in jobs]
 
 
-@app.post("/api/tickets/{ticket_id}/review", dependencies=[Depends(require_admin)])
+@app.post("/api/tickets/{ticket_id}/review", dependencies=[Depends(require_agent)])
 def review_ticket(ticket_id: int, payload: Review, db: Session = Depends(db_session)):
     ticket = db.get(Ticket, ticket_id)
     if not ticket:
@@ -319,7 +475,7 @@ def review_ticket(ticket_id: int, payload: Review, db: Session = Depends(db_sess
     return serialize(ticket)
 
 
-@app.get("/api/orders", dependencies=[Depends(require_admin)])
+@app.get("/api/orders", dependencies=[Depends(require_agent)])
 def list_orders(db: Session = Depends(db_session)):
     return [{"id": o.id, "customer_email": o.customer_email, "status": o.status, "eta": o.eta} for o in db.scalars(select(Order)).all()]
 
@@ -349,3 +505,17 @@ def seed(db: Session = Depends(db_session)):
             db.add(Order(id=id_, customer_email=email, status=status, eta=eta))
     db.commit()
     return {"orders": len(fixtures)}
+
+
+@app.get("/api/metrics", dependencies=[Depends(require_agent)])
+def metrics(db: Session = Depends(db_session)):
+    tickets = db.scalars(select(Ticket).order_by(Ticket.id.desc()).limit(1000)).all()
+    jobs = db.scalars(select(Job).order_by(Job.id.desc()).limit(1000)).all()
+    return {"total": len(tickets), "pending": sum(t.status == "pending_review" for t in tickets),
+            "approved": sum(t.status == "approved" for t in tickets),
+            "rejected": sum(t.status == "rejected" for t in tickets),
+            "urgent": sum(t.priority == "urgent" for t in tickets),
+            "escalations_pending": sum(j.status == "pending" for j in jobs),
+            "escalations_failed": sum(j.status == "failed" for j in jobs),
+            "by_category": {c: sum(t.category == c for t in tickets)
+                            for c in ("order_status", "refund", "complaint", "general")}}

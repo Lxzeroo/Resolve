@@ -1,8 +1,8 @@
 # ResolveAI · Support ticket triage with human review
 
-An executable portfolio MVP for customer-support classification, verified order lookup, draft generation, manual approvals, and audit events. Dark-mode dashboard included.
+An executable portfolio MVP for customer-support classification, verified order lookup, draft generation, manual approvals, and audit events. Includes a responsive warm-white and deep-teal operations dashboard.
 
-> **Status: Phase 2 + 3 local prototype.** Gmail read-only ingestion, Google Sheets order import, Slack escalation worker, structured optional LLM triage and offline evaluation are now implemented. No outbound customer emails. Not production-hardened; avoid real customer data until security review. See [PHASE_2_3.md](PHASE_2_3.md) for setup.
+> **Status: Phase 4 + 5 implementation on top of Phase 2 + 3.** Gmail read-only ingestion, Google Sheets order import, Slack escalation worker, structured optional LLM triage and offline evaluation are now implemented. No outbound customer emails. Not production-hardened; avoid real customer data until security review. See [DEPLOYMENT.md](DEPLOYMENT.md) and [PHASE_2_3.md](PHASE_2_3.md) for setup.
 
 ## Local quickstart (Python 3.12+)
 
@@ -30,9 +30,9 @@ Then select **Use sample** in the UI. Seed only works with `DEMO_MODE=true`.
 
 Copy `.env.example` to `.env`, then run `docker compose up --build`. Open http://127.0.0.1:8000. Docker Compose binds to localhost.
 
-## Authentication warning
+## Authentication and role-based access
 
-When `DEMO_MODE=true` and `ADMIN_TOKEN` is empty, authentication is **disabled**. Do not expose this configuration on any public network. For protected API access, set `DEMO_MODE=false` and a high-entropy `ADMIN_TOKEN` and submit it in the dashboard access-token prompt. This is a prototype-level shared token, not production user authentication.
+When `DEMO_MODE=true` and `ADMIN_TOKEN` is empty, authentication is **disabled**. Do not expose this configuration on any public network. For protected API access, set `DEMO_MODE=false` and `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD`. Sign in through the profile button. The scrypt-hashed staff credentials create short-lived hashed bearer sessions, with distinct admin and agent permissions. A high-entropy `ADMIN_TOKEN` is also supported as a legacy integration token. See `DEPLOYMENT.md`.
 
 ## Optional LLM
 
@@ -60,14 +60,14 @@ Use `X-Admin-Token` for API requests when demo mode is disabled.
 - No API keys committed; `.env` ignored.
 - Event history records manual review (not yet cryptographically tamper-evident).
 
-## Remaining milestones
+## Future hardening before real customer deployment
 
-1. Gmail OAuth, read-only ingestion, watch renewal, deduplication and message threading.
-2. Replace shared admin token with real user authentication, authorization, tenant isolation, rate limits and migrations.
-3. PostgreSQL and background queue with idempotent retries / dead-letter handling.
-4. Slack escalation, Google Sheets order sync, signed webhooks.
-5. Labeled dataset, precision/recall, calibration, and structured-output evaluation.
-6. CI/CD staging deployment, Playwright E2E, security tests and observability.
+1. Replace in-process login throttling with a distributed rate limiter and add account recovery.
+2. Add migrations, tenant isolation, field-level privacy and retention tooling.
+3. Add Gmail Pub/Sub watch renewal, message threading, and stronger input validation.
+4. Add worker leasing and dead-letter retry controls for multiple workers.
+5. Expand labeled evaluation data, model calibration and output-safety benchmarks.
+6. Configure a public TLS staging host and external monitoring after hosting credentials are available.
 
 ## Tests
 
@@ -83,3 +83,11 @@ All project data in the demonstration should be synthetic. MIT license can be ad
 - Synthetic labeled dataset and `python -m app.evaluate`
 
 See [Phase 2 + 3 setup](PHASE_2_3.md).
+
+## Phase 4 + 5 implementation
+
+- Redesigned warm-white / deep-teal responsive dashboard (no gradients, purple or emoji), consistent rounded controls.
+- Staff sign-in / logout, secure password hashing, session expiration, RBAC and throttling tests.
+- Analytics and escalation queue views, security headers, Python CI with secret guards.
+- Containerized PostgreSQL, API and separate worker stack in `docker-compose.yml`.
+- See [Deployment and security guide](DEPLOYMENT.md) for production limitations and setup.

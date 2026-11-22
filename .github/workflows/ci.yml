@@ -1,7 +1,10 @@
-name: Python CI
+name: ResolveAI CI
 on:
   push:
+    branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -10,5 +13,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - run: pip install -r requirements-dev.txt
-      - run: pytest -q
+      - run: python -m compileall -q app scripts
+      - run: python -m pytest -q
+      - name: Check accidental secret files
+        shell: bash
+        run: |
+          if git ls-files | grep -E '(^|/)(\.env$|.*\.db$|credentials\.json$|token\.json$|.*\.sqlite3?$)'; then
+            echo 'Sensitive or local database file tracked by git' >&2
+            exit 1
+          fi
